@@ -10,7 +10,7 @@ from pathlib import Path
 import pandas as pd
 
 from doggo import __version__
-from doggo.enrichment import ALTERNATIVES, EnrichmentConfig, run_enrichment
+from doggo.enrichment import ALTERNATIVES, METHODS, EnrichmentConfig, run_enrichment
 from doggo.genesets import filter_gene_sets, read_gmt
 from doggo import msigdb
 
@@ -67,11 +67,17 @@ def build_parser() -> argparse.ArgumentParser:
                     help="abs: mean |score| larger than chance (original doggo 2-tailed test); "
                          "greater / less: mean score shifted up / down; "
                          "two-sided: mean score shifted either way")
-    st.add_argument("--max-reps", type=int, default=1000, help="maximum random samples per set")
+    st.add_argument("--method", choices=METHODS, default="zscore",
+                    help="zscore: closed-form test with correlation adjustment (fast, no p floor); "
+                         "resample: Monte Carlo test of the original doggo (assumes independent genes)")
+    st.add_argument("--inter-gene-cor", type=float, default=0.01,
+                    help="zscore only: assumed average correlation between genes in a set "
+                         "(cameraPR default; 0 assumes independence and gives smaller p-values)")
+    st.add_argument("--max-reps", type=int, default=1000, help="resample only: maximum random samples per set")
     st.add_argument("--min-hits", type=int, default=21,
-                    help="stop sampling a set after this many extreme draws (0 = always run max-reps)")
+                    help="resample only: stop sampling a set after this many extreme draws (0 = always run max-reps)")
     st.add_argument("--replace", action="store_true",
-                    help="sample background rows with replacement (as the v0.3 notebooks did)")
+                    help="resample only: sample background rows with replacement (as the v0.3 notebooks did)")
     st.add_argument("--correction", default="fdr_bh",
                     help="statsmodels multipletests method: fdr_bh, bonferroni, holm, hs, fdr_by, ...")
     st.add_argument("--alpha", type=float, default=0.05, help="level for the 'significant' column")
@@ -106,6 +112,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         config = EnrichmentConfig(
             alternative=args.alternative,
+            method=args.method,
+            inter_gene_cor=args.inter_gene_cor,
             max_reps=args.max_reps,
             min_hits=args.min_hits,
             replace=args.replace,

@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from doggo import EnrichmentConfig, filter_gene_sets, read_gmt, resample_test, run_enrichment
+from doggo import EnrichmentConfig, filter_gene_sets, read_gmt, resample_test, run_enrichment, zscore_test
 from doggo.cli import main
 
 
@@ -34,13 +34,13 @@ def test_read_and_filter_gmt(toy):
     assert set(filter_gene_sets(sets, terms=["OTHER_SET"])) == {"OTHER_SET"}
 
 
-@pytest.mark.parametrize("replace", [False, True])
-def test_alternatives(toy, replace):
+@pytest.mark.parametrize("method,replace", [("zscore", False), ("resample", False), ("resample", True)])
+def test_alternatives(toy, method, replace):
     df, gmt = toy
     sets = filter_gene_sets(read_gmt(gmt), ["TEST_"])
 
     def p(alt):
-        cfg = EnrichmentConfig(alternative=alt, replace=replace, max_reps=2000)
+        cfg = EnrichmentConfig(alternative=alt, method=method, replace=replace, max_reps=2000)
         r = run_enrichment(df, sets, "gene", "score", cfg, seed=1).set_index("term")
         assert "TEST_TINY" not in r.index  # below min_size
         return r["p_value"]
@@ -66,8 +66,9 @@ def test_pvalue_never_zero_and_early_stop():
 def test_reproducible_across_jobs(toy):
     df, gmt = toy
     sets = read_gmt(gmt)
-    a = run_enrichment(df, sets, "gene", "score", seed=42, jobs=1)
-    b = run_enrichment(df, sets, "gene", "score", seed=42, jobs=2)
+    cfg = EnrichmentConfig(method="resample")
+    a = run_enrichment(df, sets, "gene", "score", cfg, seed=42, jobs=1)
+    b = run_enrichment(df, sets, "gene", "score", cfg, seed=42, jobs=2)
     pd.testing.assert_frame_equal(a, b)
 
 
@@ -129,3 +130,49 @@ def test_cli_requires_one_gene_set_source(toy, tmp_path):
         main(base)
     with pytest.raises(SystemExit):
         main(base + ["-g", str(gmt), "--org", "mouse"])
+
+
+def test_zscore_matches_two_sample_t_without_correlation():
+    from scipy import stats
+
+    rng = np.random.default_rng(5)
+    x = rng.normal(size=400)
+    idx = np.arange(30)
+    x[idx] += 0.5
+    res = zscore_test(x, idx, "two-sided", inter_gene_cor=0.0)
+    ref = stats.ttest_ind(x[idx], np.delete(x, idx))  # pooled-variance two-sample t
+    assert res["statistic"] == pytest.approx(ref.statistic)
+    assert res["p_value"] == pytest.approx(ref.pvalue)
+
+
+def test_zscore_correlation_makes_p_larger_and_directions():
+    rng = np.random.default_rng(6)
+    x = rng.normal(size=1000)
+    up, down = np.arange(50), np.arange(50, 100)
+    x[up] += 0.6
+    x[down] -= 0.6
+    p0 = zscore_test(x, up, "greater", 0.0)["p_value"]
+    p1 = zscore_test(x, up, "greater", 0.05)["p_value"]
+    assert p0 < p1 < 0.05
+    assert zscore_test(x, down, "less", 0.01)["p_value"] < 0.01
+    assert zscore_test(x, down, "greater", 0.01)["p_value"] > 0.99
+    # |x| barely moves for a modest coherent shift, so abs has less power here than less/greater
+    assert zscore_test(x, down, "abs", 0.01)["p_value"] > zscore_test(x, down, "less", 0.01)["p_value"]
+    x[down] -= 1.0
+    assert zscore_test(x, down, "abs", 0.01)["p_value"] < 0.01
+
+
+def test_zscore_calibrated_under_null():
+    rng = np.random.default_rng(8)
+    ps = []
+    for _ in range(2000):
+        x = rng.normal(size=300)
+        ps.append(zscore_test(x, np.arange(20), "two-sided", 0.0)["p_value"])
+    assert abs(np.mean(np.array(ps) < 0.05) - 0.05) < 0.015
+
+
+def test_frac_up_column(toy):
+    df, gmt = toy
+    r = run_enrichment(df, read_gmt(gmt), "gene", "score").set_index("term")
+    assert r.loc["TEST_UP", "frac_up"] > 0.9 and r.loc["TEST_DOWN", "frac_up"] < 0.1
+    assert "n_draws" not in r.columns

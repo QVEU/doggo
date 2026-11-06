@@ -1,10 +1,27 @@
-"""Resampling-based enrichment test for a per-gene score.
+"""Competitive gene set tests for a per-gene score.
 
 For each gene set, the rows of the input table whose gene is in the set are
-the "observed" sample. A statistic of their scores is compared with the same
-statistic computed on random samples of the same size drawn from all rows.
-The p-value is the fraction of random samples at least as extreme as the
-observed one.
+compared with all rows (the background). The tested quantity is the set's mean
+of a per-row value: |score| (``abs``), score (``greater``/``two-sided``) or
+-score (``less``).
+
+Two methods compute the p-value:
+
+``zscore`` (default)
+    Closed-form test of the set mean against the rest, following limma's
+    ``cameraPR`` (Wu & Smyth, 2012). The variance of the set mean is
+    inflated by ``1 + (n - 1) * inter_gene_cor`` to account for genes in a
+    set being correlated; with ``inter_gene_cor = 0`` it reduces to a
+    two-sample t-test that assumes independent genes. p-values come from a
+    t distribution with N - 2 degrees of freedom: instant, and no resolution
+    floor.
+
+``resample``
+    The original doggo Monte Carlo test. The statistic is computed on random
+    samples of the same size drawn from all rows, and the p-value is the
+    fraction at least as extreme as the observed one. It makes no
+    distributional assumption, but assumes independent genes (no
+    correlation adjustment) and its smallest p-value is 1/(max_reps+1).
 
 Sampling uses sequential early stopping (Besag & Clifford, 1991): drawing
 stops once ``min_hits`` extreme samples have been seen, giving p = h / l.
@@ -21,11 +38,13 @@ from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
+from scipy import stats
 from statsmodels.stats.multitest import multipletests
 
 log = logging.getLogger(__name__)
 
 ALTERNATIVES = ("abs", "greater", "less", "two-sided")
+METHODS = ("zscore", "resample")
 
 # Cap on the number of random indices held in memory per batch.
 _MAX_BATCH_ELEMENTS = 4_000_000
@@ -33,7 +52,11 @@ _MAX_BATCH_ELEMENTS = 4_000_000
 
 @dataclass(frozen=True)
 class EnrichmentConfig:
-    """Parameters of the resampling test.
+    """Parameters of the enrichment test.
+
+    method:        ``zscore`` (closed form, correlation-adjusted) or ``resample``.
+    inter_gene_cor: assumed average correlation between genes in a set
+                   (``zscore`` only; cameraPR default 0.01; 0 = independent).
 
     alternative:
         ``abs``       mean |score| of the set is larger than chance
@@ -53,6 +76,8 @@ class EnrichmentConfig:
     """
 
     alternative: str = "abs"
+    method: str = "zscore"
+    inter_gene_cor: float = 0.01
     max_reps: int = 1000
     min_hits: int = 21
     replace: bool = False
@@ -65,6 +90,10 @@ class EnrichmentConfig:
     def __post_init__(self) -> None:
         if self.alternative not in ALTERNATIVES:
             raise ValueError(f"alternative must be one of {ALTERNATIVES}, got {self.alternative!r}")
+        if self.method not in METHODS:
+            raise ValueError(f"method must be one of {METHODS}, got {self.method!r}")
+        if not -1.0 < self.inter_gene_cor < 1.0:
+            raise ValueError("inter_gene_cor must be between -1 and 1")
         if self.max_reps < 1:
             raise ValueError("max_reps must be >= 1")
         if self.min_hits < 0:
@@ -151,18 +180,40 @@ def resample_test(
     else:
         p = (hits + 1) / (draws + 1)
 
-    member_scores = scores[member_idx]
-    return {
-        "n_matched": n,
-        "set_mean": float(member_scores.mean()),
-        "set_mean_abs": float(np.abs(member_scores).mean()),
-        "background_mean": float(scores.mean()),
-        "effect": float(member_scores.mean() - scores.mean()),
-        "statistic": observed,
-        "n_draws": draws,
-        "n_extreme": hits,
-        "p_value": float(p),
-    }
+    return {"statistic": observed, "n_draws": draws, "n_extreme": hits, "p_value": float(p)}
+
+
+def zscore_test(
+    scores: np.ndarray,
+    member_idx: np.ndarray,
+    alternative: str = "abs",
+    inter_gene_cor: float = 0.01,
+) -> dict:
+    """Closed-form, correlation-adjusted test of one set (cameraPR formula).
+
+    Returns the moderated t statistic (positive = set mean above the rest,
+    for the transformed values) and its p-value.
+    """
+    values = _transform(np.asarray(scores, dtype=float), alternative)
+    N = values.shape[0]
+    n = int(len(member_idx))
+    if n == 0 or n >= N - 1:
+        return {"statistic": np.nan, "p_value": np.nan}
+    mean_all = values.mean()
+    var_all = values.var(ddof=1)
+    delta = N / (N - n) * (values[member_idx].mean() - mean_all)  # set mean minus mean of the rest
+    var_pooled = ((N - 1) * var_all - delta**2 * n * (N - n) / N) / (N - 2)
+    vif = 1.0 + (n - 1) * inter_gene_cor
+    denom = var_pooled * (vif / n + 1.0 / (N - n))
+    if denom <= 0:
+        return {"statistic": np.nan, "p_value": np.nan}
+    t = delta / np.sqrt(denom)
+    df = N - 2
+    if alternative == "two-sided":
+        p = 2.0 * stats.t.sf(abs(t), df)
+    else:  # abs / greater / less are upper-tail tests on the transformed values
+        p = stats.t.sf(t, df)
+    return {"statistic": float(t), "p_value": float(min(1.0, p))}
 
 
 def _match(genes: pd.Series, gene_sets: dict[str, list[str]], ignore_case: bool):
@@ -191,17 +242,34 @@ def _init_worker(scores: np.ndarray, config: EnrichmentConfig) -> None:
     _SHARED["config"] = config
 
 
+def _describe(scores: np.ndarray, idx: np.ndarray) -> dict:
+    s = scores[idx]
+    return {
+        "n_matched": len(idx),
+        "set_mean": float(s.mean()),
+        "set_mean_abs": float(np.abs(s).mean()),
+        "frac_up": float((s > 0).mean()),
+        "background_mean": float(scores.mean()),
+        "background_mean_abs": float(np.abs(scores).mean()),
+        "effect": float(s.mean() - scores.mean()),
+    }
+
+
 def _worker(args):
     term, n_in_set, idx, seed = args
-    rng = np.random.default_rng(seed)
-    res = resample_test(_SHARED["scores"], idx, _SHARED["config"], rng)
-    return {"term": term, "set_size": n_in_set, **res}
+    scores, config = _SHARED["scores"], _SHARED["config"]
+    res = resample_test(scores, idx, config, np.random.default_rng(seed))
+    return {"term": term, "set_size": n_in_set, **_describe(scores, idx), **res}
 
 
-RESULT_COLUMNS = [
-    "term", "set_size", "n_matched", "set_mean", "set_mean_abs", "background_mean",
-    "effect", "statistic", "n_draws", "n_extreme", "p_value", "p_adj", "significant",
+DESCRIPTIVE_COLUMNS = [
+    "term", "set_size", "n_matched", "set_mean", "set_mean_abs", "frac_up",
+    "background_mean", "background_mean_abs", "effect",
 ]
+RESULT_COLUMNS = {
+    "zscore": DESCRIPTIVE_COLUMNS + ["statistic", "p_value", "p_adj", "significant"],
+    "resample": DESCRIPTIVE_COLUMNS + ["statistic", "n_draws", "n_extreme", "p_value", "p_adj", "significant"],
+}
 
 
 def run_enrichment(
@@ -253,6 +321,14 @@ def run_enrichment(
             "gene identifier type/species, or try --ignore-case.", config.min_size, n_hit,
         )
 
+    if config.method == "zscore":
+        rows = [
+            {"term": t, "set_size": s, **_describe(scores, i),
+             **zscore_test(scores, i, config.alternative, config.inter_gene_cor)}
+            for t, s, i in tasks
+        ]
+        return _finish(rows, config)
+
     seeds = np.random.SeedSequence(seed).spawn(len(tasks))
     payload = [(t, s, i, ss) for (t, s, i), ss in zip(tasks, seeds)]
 
@@ -269,20 +345,30 @@ def run_enrichment(
             if k % 250 == 0:
                 log.info("  %d / %d sets", k, len(payload))
 
-    res = pd.DataFrame(rows, columns=RESULT_COLUMNS[:-2])
-    if res.empty:
-        res["p_adj"] = pd.Series(dtype=float)
-        res["significant"] = pd.Series(dtype=bool)
-        return res
-    reject, p_adj, _, _ = multipletests(res["p_value"].to_numpy(), alpha=config.alpha, method=config.correction)
-    res["p_adj"] = p_adj
-    res["significant"] = reject
+    res = _finish(rows, config)
     floor = 1.0 / (config.max_reps + 1)
     n_floor = int((res["p_value"] <= floor * (1 + 1e-9)).sum())
     if n_floor:
         log.warning(
             "%d of %d sets reached the resolution limit p = 1/(max_reps+1) = %.2g; "
-            "increase --max-reps to rank them and to give the multiple-testing correction room.",
+            "increase --max-reps or use --method zscore.",
             n_floor, len(res), floor,
         )
+    return res
+
+
+def _finish(rows: list[dict], config: EnrichmentConfig) -> pd.DataFrame:
+    res = pd.DataFrame(rows, columns=RESULT_COLUMNS[config.method][:-2])
+    if res.empty:
+        res["p_adj"] = pd.Series(dtype=float)
+        res["significant"] = pd.Series(dtype=bool)
+        return res
+    p = res["p_value"].to_numpy(dtype=float)
+    ok = ~np.isnan(p)
+    p_adj = np.full_like(p, np.nan)
+    reject = np.zeros(len(p), dtype=bool)
+    if ok.any():
+        reject[ok], p_adj[ok], _, _ = multipletests(p[ok], alpha=config.alpha, method=config.correction)
+    res["p_adj"] = p_adj
+    res["significant"] = reject
     return res.sort_values(["p_value", "term"], kind="mergesort").reset_index(drop=True)
