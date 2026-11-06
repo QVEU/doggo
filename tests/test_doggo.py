@@ -93,3 +93,39 @@ def test_missing_column_errors(toy, tmp_path):
     with pytest.raises(SystemExit):
         main(["-i", str(inp), "-g", str(gmt), "-o", str(tmp_path / "o.csv"), "--gene-col", "nope",
               "--score-col", "score", "-q"])
+
+
+def test_org_aliases_and_urls():
+    from doggo import msigdb
+
+    assert msigdb.normalize_org("Mouse") == msigdb.normalize_org("mm") == "Mm"
+    assert msigdb.normalize_org("human") == msigdb.normalize_org("HS") == "Hs"
+    with pytest.raises(ValueError):
+        msigdb.normalize_org("zebrafish")
+    assert msigdb.gmt_url("mouse", "2022.1").endswith("/2022.1.Mm/msigdb.v2022.1.Mm.symbols.gmt")
+
+
+def test_cli_org_uses_cache(toy, tmp_path, monkeypatch):
+    df, gmt = toy
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    (cache / "msigdb.v9999.1.Mm.symbols.gmt").write_text(gmt.read_text())
+    monkeypatch.setenv("DOGGO_CACHE", str(cache))
+    inp = tmp_path / "in.csv"
+    df.to_csv(inp, index=False)
+    out = tmp_path / "res.csv"
+    rc = main(["-i", str(inp), "-org", "mouse", "--msigdb-version", "9999.1", "-o", str(out),
+               "--gene-col", "gene", "--score-col", "score", "--prefix", "TEST_", "--seed", "1", "-q"])
+    assert rc == 0
+    assert set(pd.read_csv(out)["term"]) == {"TEST_UP", "TEST_DOWN", "TEST_NULL"}
+
+
+def test_cli_requires_one_gene_set_source(toy, tmp_path):
+    df, gmt = toy
+    inp = tmp_path / "in.csv"
+    df.to_csv(inp, index=False)
+    base = ["-i", str(inp), "-o", str(tmp_path / "o.csv"), "--gene-col", "gene", "--score-col", "score"]
+    with pytest.raises(SystemExit):
+        main(base)
+    with pytest.raises(SystemExit):
+        main(base + ["-g", str(gmt), "--org", "mouse"])

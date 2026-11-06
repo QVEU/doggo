@@ -42,26 +42,49 @@ Inputs:
 
 * **A table** (CSV or TSV, optionally gzipped) with one row per gene, containing a
   gene identifier column and a numeric score column. Extra columns are fine.
-* **Gene sets** in GMT format, e.g. from [MSigDB](https://www.gsea-msigdb.org/gsea/msigdb).
-  Identifiers must match your gene column (use mouse sets for mouse symbols).
-  `msigdb.v2022.1.Mm.symbols.gmt.txt` (mouse) and `msigdb.v7.1.symbols.gmt` (human) are included.
+* **Gene sets**, either:
+  * `--org human` or `--org mouse` (`-org` also works): the full
+    [MSigDB](https://www.gsea-msigdb.org/gsea/msigdb) collection for that organism
+    (MSigDB only covers these two). It is downloaded from the Broad Institute on
+    first use, checked against a pinned SHA-256 and cached, so later runs work offline.
+    The default release is **2026.2**; `--msigdb-version 2022.1` reproduces older analyses, and
+    `--id-type entrez` switches from gene symbols to NCBI Gene IDs. Or:
+  * `-g/--gmt FILE`: any GMT file (a single MSigDB collection, a custom set list, ...).
+
+  Identifiers must match your gene column: use mouse sets for mouse symbols, and `--ignore-case`
+  if your table has uppercase symbols.
 
 ```bash
 # Bulk table, Reactome sets only
-doggo -i results.csv -g msigdb.v2022.1.Mm.symbols.gmt.txt -o enrichment.csv \
+doggo -i results.csv -org mouse -o enrichment.csv \
       --gene-col ext_gene --score-col b --prefix REACTOME_ --seed 1
 
 # 10x / Seurat FindAllMarkers output: one analysis per cluster, 4 CPUs
 doggo -i 10x_doggo/Myeloid_cells_updated_0.4res.all_markers_genes.csv \
-      -g msigdb.v2022.1.Mm.symbols.gmt.txt -o markers_enrichment.csv \
+      -org mouse -o markers_enrichment.csv \
       --gene-col gene --score-col avg_log2FC --group-col cluster \
       --prefix REACTOME_ --seed 1 -j 4
 
 # Long table with several parameters per gene: pick one, uppercase symbols vs. mouse sets
-doggo -i allParameters_PV-CVB_22920.csv -g msigdb.v2022.1.Mm.symbols.gmt.txt -o pv_max.csv \
+doggo -i allParameters_PV-CVB_22920.csv -org mouse -o pv_max.csv \
       --gene-col target --score-col SigFactor_PV --filter Param=Max \
       --ignore-case --prefix REACTOME_ --prefix GOBP_ --max-reps 10000
 ```
+
+### Gene set downloads
+
+`--org` fetches files automatically. To pre-download, e.g. before working offline or on a
+cluster node without internet:
+
+```bash
+doggo-fetch                                   # human + mouse, gene symbols
+doggo-fetch --org mouse --id-type symbols entrez --msigdb-version 2026.2
+```
+
+Files go to `$DOGGO_CACHE`, else `$XDG_CACHE_HOME/doggo`, else `~/.cache/doggo`; set
+`DOGGO_CACHE` to share one copy between users. They are not stored in this repository.
+The files can also be downloaded by hand from
+<https://data.broadinstitute.org/gsea-msigdb/msigdb/release/> and passed with `-g`.
 
 Key options (see `doggo --help` for all):
 
@@ -88,8 +111,9 @@ From Python:
 ```python
 import pandas as pd
 from doggo import EnrichmentConfig, filter_gene_sets, read_gmt, run_enrichment
+from doggo.msigdb import fetch_gmt
 
-sets = filter_gene_sets(read_gmt("msigdb.v2022.1.Mm.symbols.gmt.txt"), ["REACTOME_"])
+sets = filter_gene_sets(read_gmt(fetch_gmt("mouse")), ["REACTOME_"])
 res = run_enrichment(pd.read_csv("results.csv"), sets, gene_col="ext_gene", score_col="b",
                      config=EnrichmentConfig(max_reps=5000), seed=1, jobs=4)
 ```

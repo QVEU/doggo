@@ -166,6 +166,8 @@ def resample_test(
 
 
 def _match(genes: pd.Series, gene_sets: dict[str, list[str]], ignore_case: bool):
+    if pd.api.types.is_float_dtype(genes) and (genes.dropna() % 1 == 0).all():
+        genes = genes.astype("Int64")  # e.g. Entrez IDs read as floats: 1234.0 -> "1234"
     keys = genes.astype(str).str.strip()
     if ignore_case:
         keys = keys.str.upper()

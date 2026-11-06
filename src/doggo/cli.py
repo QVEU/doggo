@@ -12,6 +12,7 @@ import pandas as pd
 from doggo import __version__
 from doggo.enrichment import ALTERNATIVES, EnrichmentConfig, run_enrichment
 from doggo.genesets import filter_gene_sets, read_gmt
+from doggo import msigdb
 
 log = logging.getLogger("doggo")
 
@@ -34,7 +35,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     io = p.add_argument_group("input / output")
     io.add_argument("-i", "--input", required=True, help="table with one row per gene (CSV/TSV, optionally .gz)")
-    io.add_argument("-g", "--gmt", required=True, help="gene set collection in GMT format (e.g. from MSigDB)")
+    src = io.add_mutually_exclusive_group(required=True)
+    src.add_argument("-g", "--gmt", help="gene set collection in GMT format (any source)")
+    src.add_argument("--org", "-org", dest="org",
+                     help="use the full MSigDB collection for this organism: human or mouse "
+                          "(downloaded once and cached; aliases hs, mm)")
     io.add_argument("-o", "--output", required=True, help="output CSV path")
     io.add_argument("--sep", default=None, help="input delimiter (default: tab for .tsv/.txt/.tab, else comma)")
     io.add_argument("--gene-col", required=True, help="column holding gene identifiers matching the GMT")
@@ -47,6 +52,10 @@ def build_parser() -> argparse.ArgumentParser:
     io.add_argument("--ignore-case", action="store_true", help="match gene symbols case-insensitively")
 
     gs = p.add_argument_group("gene sets")
+    gs.add_argument("--msigdb-version", default=msigdb.DEFAULT_VERSION,
+                    help="MSigDB release used with --org, e.g. 2026.2 or 2022.1")
+    gs.add_argument("--id-type", choices=msigdb.ID_TYPES, default="symbols",
+                    help="gene identifiers used with --org: symbols or entrez (NCBI Gene IDs)")
     gs.add_argument("--prefix", action="append", default=[],
                     help="only test sets whose name starts with this (repeatable), e.g. REACTOME_ or GOBP_")
     gs.add_argument("--term", action="append", default=[], help="test this exact set name (repeatable)")
@@ -108,8 +117,15 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as e:
         raise SystemExit(f"error: {e}")
 
-    sets = filter_gene_sets(read_gmt(args.gmt), args.prefix, args.term)
-    log.info("loaded %d gene sets from %s", len(sets), args.gmt)
+    if args.org:
+        try:
+            gmt = msigdb.fetch_gmt(args.org, args.msigdb_version, args.id_type)
+        except (ValueError, RuntimeError) as e:
+            raise SystemExit(f"error: {e}")
+    else:
+        gmt = args.gmt
+    sets = filter_gene_sets(read_gmt(gmt), args.prefix, args.term)
+    log.info("loaded %d gene sets from %s", len(sets), gmt)
     if not sets:
         raise SystemExit("error: no gene sets left after --prefix/--term filtering")
 
